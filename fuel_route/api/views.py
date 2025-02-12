@@ -130,15 +130,46 @@ def calculate_fuel_cost(route, affordable_stations, max_range, mpg, fuel_price):
     
     return best_cost, fuel_cost_messages
 
-def is_within_distance(post, start_coords, end_coords, max_distance=300):
+def find_nearby_stations(route, fuel_stations, max_distance=10):
     """
-    Checks if a fuel station is within a certain distance from any point on the route.
-    Defaults to a maximum of 300 miles from either the start or end.
-    """
-    distance_to_start = calculate_distance((post["latitude"], post["longitude"]), start_coords)
-    distance_to_end = calculate_distance((post["latitude"], post["longitude"]), end_coords)
+    Filtra os postos de combustível mais próximos à rota, evitando duplicatas.
+    
+    Parâmetros:
+    - route: Lista de coordenadas (longitude, latitude) da rota.
+    - fuel_stations: Lista de postos de combustível carregados do arquivo.
+    - max_distance: Distância máxima (em milhas) para considerar um posto próximo da rota.
 
-    return distance_to_start <= max_distance or distance_to_end <= max_distance
+    Retorna:
+    - Lista de postos únicos dentro da distância máxima da rota.
+    """
+    route_df = pd.DataFrame(route, columns=["longitude", "latitude"])
+    fuel_df = pd.DataFrame(fuel_stations)
+    
+    # Ordenar os postos pelo valor mais próximo das coordenadas da rota
+    fuel_df = fuel_df.sort_values(by=["latitude", "longitude"])
+
+    nearby_stations = []
+    seen_stations = set()  # Conjunto para evitar duplicatas
+
+    for _, row in route_df.iterrows():
+        lat, lon = row["latitude"], row["longitude"]
+
+        potential_stations = fuel_df[
+            (fuel_df["latitude"].between(lat - 0.1, lat + 0.1)) & 
+            (fuel_df["longitude"].between(lon - 0.1, lon + 0.1))
+        ]
+        
+        for _, station in potential_stations.iterrows():
+            station_coords = (station["latitude"], station["longitude"])
+
+            if station_coords not in seen_stations:
+                if calculate_distance(station_coords, (lat, lon)) <= max_distance:
+                    nearby_stations.append(station.to_dict())
+                    seen_stations.add(station_coords)  # Adiciona ao conjunto de postos já incluídos
+
+    return nearby_stations
+
+
 
 def create_route_map(start_coords, finish_coords, route, fuel_stops):
     """
@@ -197,7 +228,7 @@ def calculate_route(request):
     fuel_stations = load_fuel_prices()
 
     # Filter stations within 10 miles of any point on the route
-    affordable_stations = [station for station in fuel_stations if is_within_distance(station, start_coords, finish_coords)]
+    affordable_stations = find_nearby_stations(route, fuel_stations, max_distance=10)
 
     # Calculate total fuel cost and generate cost messages
     total_cost, fuel_cost_messages = calculate_fuel_cost(route, affordable_stations, max_range=500, mpg=10, fuel_price=3.0)
