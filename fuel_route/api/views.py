@@ -13,7 +13,7 @@ import geopy.distance
 FUEL_XLSX_FILE = os.path.join(os.path.dirname(__file__), "fuel_prices.xlsx")
 
 # Google API Key (Substitua pela sua chave válida)
-API_KEY = "AIzaSyBogaEWk_zBktHsax4yWagruLwibpgMNbM"
+API_KEY = ""
 
 # Google Geocoding API URL
 GEOCODE_API_URL = "https://maps.googleapis.com/maps/api/geocode/json"
