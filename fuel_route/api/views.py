@@ -1,131 +1,185 @@
-import pandas as pd
 import os
 import requests
-import time
-import asyncio
-import aiohttp
+import pandas as pd
 from django.http import JsonResponse
 from rest_framework.decorators import api_view
-import csv
-import geopy.distance
+from geopy.distance import geodesic
+import folium
+from folium.plugins import MarkerCluster
+from django.conf import settings
+import time
 
 # Caminho para o arquivo Excel
 FUEL_XLSX_FILE = os.path.join(os.path.dirname(__file__), "fuel_prices.xlsx")
 
-# Google API Key (Substitua pela sua chave válida)
-API_KEY = "AIzaSyBogaEWk_zBktHsax4yWagruLwibpgMNbM"
+# Substituímos a Google API pelo OSRM (OpenStreetMap Routing Machine)
+OSRM_API_URL = "http://router.project-osrm.org/route/v1/driving"
 
-# Google Geocoding API URL
-GEOCODE_API_URL = "https://maps.googleapis.com/maps/api/geocode/json"
-
-# Função para obter coordenadas a partir de um endereço com requisição assíncrona
-async def get_coordinates(address, session):
-    url = f"https://maps.googleapis.com/maps/api/geocode/json?address={address}&key={API_KEY}"
-    async with session.get(url) as response:
-        if response.status == 200:  # Alterado de status_code para status
-            data = await response.json()
-            results = data.get("results")
-            if results:
-                lat = results[0]["geometry"]["location"]["lat"]
-                lon = results[0]["geometry"]["location"]["lng"]
-                return lat, lon
-        return None, None
-
-# Função para atualizar o arquivo XLSX com as coordenadas
-async def update_xlsx_with_coordinates():
-    # Carregar o arquivo XLSX com pandas
-    df = pd.read_excel(FUEL_XLSX_FILE)
-
-    # Limpeza de possíveis espaços extras nos nomes das colunas e nos dados
-    df.columns = df.columns.str.strip()
-    df['Address'] = df['Address'].str.strip()
-    df['City'] = df['City'].str.strip()
-    df['State'] = df['State'].str.strip()
-    df['Truckstop Name'] = df['Truckstop Name'].str.strip()
-
-    # Adiciona as colunas de Latitude e Longitude, se não existirem
-    if 'Latitude' not in df.columns:
-        df['Latitude'] = None
-    if 'Longitude' not in df.columns:
-        df['Longitude'] = None
-
-    needs_update = True  # Flag para verificar se alguma atualização foi feita
-
-    # Preparar as tarefas assíncronas para obtenção das coordenadas
-    async with aiohttp.ClientSession() as session:
-        tasks = []
-        for index, row in df.iterrows():
-            # Verifica se as colunas de endereço, cidade, estado e nome do truckstop têm dados
-            if pd.notna(row['Address']) and pd.notna(row['City']) and pd.notna(row['State']) and pd.notna(row['Truckstop Name']):
-                address = f"{row['Address']}, {row['City']}, {row['State']}"
-                
-                # Verifica se a latitude e longitude estão ausentes ou vazias
-                if pd.isna(row['Latitude']) or pd.isna(row['Longitude']):
-                    tasks.append(update_coordinates(index, row, address, df, session))  # Adiciona a tarefa
-
-        # Executa todas as tarefas assíncronas simultaneamente
-        await asyncio.gather(*tasks)
-
-    # Se alguma atualização foi feita, salva de volta no arquivo XLSX
-    if needs_update:
-        df.to_excel(FUEL_XLSX_FILE, index=False)
-
-# Função para atualizar coordenadas em uma linha específica
-async def update_coordinates(index, row, address, df, session):
-    lat, lon = await get_coordinates(address, session)
-    if lat and lon:
-        df.at[index, 'Latitude'] = lat
-        df.at[index, 'Longitude'] = lon
-        print(f"Obtido lat/long para: {address} -> {lat}, {lon}")
-    else:
-        print(f"Não foi possível obter lat/long para: {address}")
-
-# Executa a atualização do XLSX
-async def main():
-    await update_xlsx_with_coordinates()
-
-# Executa a função principal de maneira assíncrona
-asyncio.run(main())
-
-# This sets up the free map API configuration for route calculation
-MAPS_API_URL = "https://router.project-osrm.org/route/v1/driving"
-
-# This function loads the fuel stations' information from the CSV file
+# Função para carregar as informações dos postos de gasolina a partir do arquivo XLSX
 def load_fuel_prices():
+    """
+    Carrega os dados de postos de combustível a partir de um arquivo Excel,
+    retornando uma lista de dicionários com informações dos postos.
+    """
     fuel_stations = []
-    with open(FUEL_XLSX_FILE, newline='', encoding='utf-8') as csvfile:
-        reader = csv.DictReader(csvfile)
-        for row in reader:
-            fuel_stations.append({
-                "id": row["OPIS Truckstop ID"],
-                "name": row["Truckstop Name"],
-                "address": row["Address"],
-                "city": row["City"],
-                "state": row["State"],
-                "retail_price": float(row["Retail Price"]),
-                "latitude": float(row["Latitude"]),  # Coordinates of each station
-                "longitude": float(row["Longitude"])
-            })
+    df = pd.read_excel(FUEL_XLSX_FILE)
+    df = df.dropna(subset=["Latitude", "Longitude"])  # Remove entradas sem coordenadas
+
+    for _, row in df.iterrows():
+        fuel_stations.append({
+            "name": row["Truckstop Name"],
+            "address": row["Address"],
+            "city": row["City"],
+            "state": row["State"],
+            "retail_price": row["Retail Price"],
+            "latitude": row["Latitude"],
+            "longitude": row["Longitude"]
+        })
+
     return fuel_stations
 
-# This function calculates the distance between two coordinates using the Haversine formula
+# Função para calcular a distância entre duas coordenadas usando a fórmula de Haversine
 def calculate_distance(coord1, coord2):
-    return geopy.distance.distance(coord1, coord2).miles
+    """
+    Calcula a distância geodésica entre dois pontos (latitude, longitude).
+    """
+    coord1 = (float(coord1[0]), float(coord1[1]))  # [longitude, latitude] -> (latitude, longitude)
+    coord2 = (float(coord2[0]), float(coord2[1]))
 
-# This function checks if a fuel station is within a reasonable distance (10 miles) from the route
-def is_within_route_range(route_coordinates, station_coords, max_distance=10):
-    for i in range(len(route_coordinates) - 1):
-        segment_start = route_coordinates[i]
-        segment_end = route_coordinates[i + 1]
-        distance_to_segment = geopy.distance.distance(station_coords, segment_start).miles + \
-                              geopy.distance.distance(station_coords, segment_end).miles
-        segment_distance = geopy.distance.distance(segment_start, segment_end).miles
-        if distance_to_segment <= segment_distance + max_distance:
-            return True
-    return False
+    distance = geodesic(coord1, coord2).miles
+    return distance
 
+# Função para validar coordenadas
+def validate_coordinates(coordinate):
+    """
+    Valida e converte as coordenadas fornecidas para o formato float.
+    Retorna as coordenadas ou None se inválidas.
+    """
+    try:
+        lat, lon = map(float, coordinate)
+        return lat, lon
+    except (ValueError, TypeError):
+        return None  # Retorna None se as coordenadas não forem válidas
+
+# Função para calcular a rota usando o OSRM
+def get_route(start_coords, end_coords):
+    """
+    Consulta a API OSRM para obter a rota entre as coordenadas de início e fim.
+    Retorna a rota em formato de coordenadas ou None em caso de erro.
+    """
+    url = f"{OSRM_API_URL}/{start_coords[1]},{start_coords[0]};{end_coords[1]},{end_coords[0]}?overview=full&geometries=geojson"
+    response = requests.get(url)
+    
+    if response.status_code != 200:
+        return None
+
+    route_data = response.json()
+    
+    if "routes" in route_data and route_data["routes"]:
+        return route_data["routes"][0]["geometry"]["coordinates"]
+    
+    return None
+
+def calculate_total_route_distance(route):
+    """
+    Calcula a distância total percorrida na rota, considerando os postos de combustível.
+    A rota é uma lista de coordenadas (latitude, longitude).
+    """
+    total_distance = 0
+    
+    if len(route) < 2:
+        return 0
+
+    for i in range(len(route) - 1):
+        start = route[i]
+        end = route[i + 1]
+
+        start_inverted = (start[1], start[0])  # Invertendo latitude e longitude
+        end_inverted = (end[1], end[0])  # Invertendo latitude e longitude
+
+        distance = calculate_distance(start_inverted, end_inverted)  # Reutiliza a função de Haversine
+        total_distance += distance
+    
+    if total_distance == 0:
+        return 0
+
+    return total_distance
+
+def calculate_fuel_cost(route, affordable_stations, max_range, mpg, fuel_price):
+    """
+    Calcula o custo de combustível para a rota, considerando postos de combustível viáveis.
+    Retorna o custo total e mensagens relacionadas aos custos de abastecimento.
+    """
+    total_cost = 0
+    best_station = None
+    best_cost = float('inf')
+
+    # Calcular a distância total da rota
+    total_distance = calculate_total_route_distance(route)
+
+    # Calcular o custo de combustível para cada posto
+    for station in affordable_stations:
+        station_distance = calculate_distance((route[0][1], route[0][0]), (station['latitude'], station['longitude']))
+
+        if station_distance <= max_range:  # O posto deve estar dentro da autonomia do veículo
+            gallons_needed = total_distance / mpg  # Calcula o número de galões para percorrer a distância
+
+            cost_at_station = gallons_needed * station['retail_price']
+
+            # Verificar se o posto tem o custo mais baixo
+            if cost_at_station < best_cost:
+                best_cost = cost_at_station
+                best_station = station
+
+    if best_station is None:
+        fuel_cost_messages = ["Nenhum posto dentro da autonomia do veículo."]
+    else:
+        fuel_cost_messages = [f"Custo de abastecimento no posto {best_station['name']} - ${best_cost:.2f}"]
+    
+    return best_cost, fuel_cost_messages
+
+# Função para verificar se o posto está dentro de uma faixa geográfica relevante
+def is_within_distance(post, start_coords, end_coords, max_distance=300):
+    """
+    Verifica se um posto está dentro de um raio máximo de 10 milhas de qualquer ponto da rota.
+    """
+    distance_to_start = calculate_distance((post["latitude"], post["longitude"]), start_coords)
+    distance_to_end = calculate_distance((post["latitude"], post["longitude"]), end_coords)
+
+    return distance_to_start <= max_distance or distance_to_end <= max_distance
+
+# Função para criar um mapa interativo com a rota e postos de gasolina
+def create_route_map(start_coords, finish_coords, route, fuel_stops):
+    """
+    Cria um mapa interativo usando a biblioteca Folium, com a rota e postos de combustível.
+    """
+    mid_lat = (start_coords[0] + finish_coords[0]) / 2
+    mid_lon = (start_coords[1] + finish_coords[1]) / 2
+    route_map = folium.Map(location=[mid_lat, mid_lon], zoom_start=12)
+
+    route_line = folium.PolyLine(locations=[(lat, lon) for lon, lat in route], color='blue', weight=5, opacity=0.7)
+    route_map.add_child(route_line)
+
+    marker_cluster = MarkerCluster().add_to(route_map)
+    for station in fuel_stops:
+        folium.Marker(
+            location=[station["latitude"], station["longitude"]],
+            popup=f"{station['name']}<br>{station['address']}<br>Price: ${station['retail_price']}",
+            icon=folium.Icon(color='green', icon='cloud')
+        ).add_to(marker_cluster)
+
+    folium.Marker(location=[start_coords[0], start_coords[1]], popup='Start', icon=folium.Icon(color='red')).add_to(route_map)
+    folium.Marker(location=[finish_coords[0], finish_coords[1]], popup='Finish', icon=folium.Icon(color='blue')).add_to(route_map)
+
+    return route_map
+
+# Função principal para calcular a rota e identificar postos de gasolina viáveis
 @api_view(["POST"])
 def calculate_route(request):
+    """
+    Função principal que recebe as coordenadas de início e fim, calcula a rota, verifica postos de combustível
+    acessíveis ao longo do caminho e retorna informações detalhadas, incluindo um mapa da rota.
+    """
     data = request.data
     start_location = data.get("start_location")
     finish_location = data.get("finish_location")
@@ -133,78 +187,48 @@ def calculate_route(request):
     if not start_location or not finish_location:
         return JsonResponse({"error": "Both start_location and finish_location fields are required."}, status=400)
 
-    # Request route data from the API and extract the total distance and coordinates
-    route_response = requests.get(f"{MAPS_API_URL}/{start_location};{finish_location}?overview=true&geometries=geojson")
-    route_data = route_response.json()
+    try:
+        start_coords = validate_coordinates(start_location.split(","))
+        finish_coords = validate_coordinates(finish_location.split(","))
+        if not start_coords or not finish_coords:
+            raise ValueError("Invalid coordinates")
+    except ValueError:
+        return JsonResponse({"error": "Invalid coordinates format. Expected 'lat,lon'."}, status=400)
 
-    if "routes" not in route_data or not route_data["routes"]:
-        return JsonResponse({"error": "Could not calculate the route."}, status=400)
+    # Obter a rota usando o OSRM
+    route = get_route(start_coords, finish_coords)
+    if not route:
+        return JsonResponse({"error": "Failed to retrieve route from OSRM."}, status=500)
 
-    total_distance_miles = route_data["routes"][0]["distance"] / 1609  # Convert meters to miles
-    route_coordinates = route_data["routes"][0]["geometry"]["coordinates"]  # Coordinates of the route
-
-    # Vehicle parameters
-    mpg = 10  # Miles per gallon
-    max_range = 500  # Maximum range of the vehicle
-    MIN_FUEL_RESERVE = 50  # Minimum fuel reserve in miles
-    current_fuel = max_range  # The vehicle starts with a full tank
+    # Carregar postos de gasolina
     fuel_stations = load_fuel_prices()
 
-    remaining_distance = total_distance_miles
-    current_location = start_location
-    stops = []
-    total_fuel_cost = 0
+    # Filtrar postos dentro de um raio de 10 milhas de qualquer ponto da rota
+    affordable_stations = [station for station in fuel_stations if is_within_distance(station, start_coords, finish_coords)]
 
-    # Logic for deciding when to refuel
-    while remaining_distance > 0:
-        autonomy_left = current_fuel * mpg  # How many miles the vehicle can go with the current fuel
+    # Calcular o custo total de combustível e obter as mensagens
+    total_cost, fuel_cost_messages = calculate_fuel_cost(route, affordable_stations, max_range=500, mpg=10, fuel_price=3.0)
 
-        # Filter stations that are affordable and within range of the route
-        affordable_stations = [
-            station for station in fuel_stations if station["retail_price"] is not None and is_within_route_range(route_coordinates, (station["latitude"], station["longitude"]))
-        ]
+    # Criar o mapa com a rota e os postos
+    route_map = create_route_map(start_coords, finish_coords, route, affordable_stations)
 
-        if affordable_stations:
-            cheapest_station = min(affordable_stations, key=lambda s: s["retail_price"])
+    # Gerar um nome único para o arquivo com base no timestamp
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    map_filename = f"route_map_{timestamp}.html"
+    map_file_path = os.path.join(settings.MEDIA_ROOT, map_filename)
 
-            # Calculate the distance to the cheapest station
-            distance_to_station = calculate_distance(current_location, (cheapest_station["latitude"], cheapest_station["longitude"]))
+    # Salve o mapa com o nome único
+    route_map.save(map_file_path)
 
-            # Calculate how much fuel is needed to reach that station
-            fuel_needed = distance_to_station / mpg
-
-            # Check if the station is within reach, considering the remaining fuel and minimum reserve
-            if distance_to_station <= autonomy_left - MIN_FUEL_RESERVE:
-                cost = fuel_needed * cheapest_station["retail_price"]
-
-                stops.append({
-                    "location": f"{cheapest_station['city']}, {cheapest_station['state']}",
-                    "fuel_price": cheapest_station["retail_price"],
-                    "fuel_needed": round(fuel_needed, 2),
-                    "cost": round(cost, 2)
-                })
-
-                total_fuel_cost += cost
-                current_fuel = max_range  # Refill the tank
-                remaining_distance -= distance_to_station  # Subtract the traveled distance
-            else:
-                remaining_distance -= autonomy_left  # Continue with the remaining autonomy
-        else:
-            return JsonResponse({"error": "No fuel stations found along the route."}, status=400)
-
-    # Check if there's still distance to cover to the destination, considering the fuel reserve
-    if remaining_distance > 0:
-        final_leg_fuel_needed = remaining_distance / mpg
-        stops.append({
-            "location": "Final Destination",
-            "fuel_needed": round(final_leg_fuel_needed, 2),
-            "cost": round(final_leg_fuel_needed * cheapest_station["retail_price"], 2)
-        })
-
+    # Retorne o link do arquivo gerado
+    map_url = os.path.join(settings.MEDIA_URL, map_filename)
+    
+    # Retornar a resposta com o link para o mapa e os postos de combustível
     response_data = {
-        "route_map": f"https://www.google.com/maps/dir/{start_location}/{finish_location}",
-        "fuel_stops": stops,
-        "total_fuel_cost": round(total_fuel_cost, 2)
+        "map_url": map_url,
+        "fuel_stops": affordable_stations,
+        "total_cost": f"${total_cost:.2f}",
+        "fuel_cost_messages": fuel_cost_messages
     }
 
     return JsonResponse(response_data)
