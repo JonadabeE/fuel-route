@@ -1,118 +1,91 @@
 import pandas as pd
 import os
 import requests
-import csv
 import time
+import asyncio
+import aiohttp
 from django.http import JsonResponse
 from rest_framework.decorators import api_view
+import csv
 import geopy.distance
 
-# Path to the CSV file
-FUEL_CSV_FILE = os.path.join(os.path.dirname(__file__), "fuel_prices.csv")
+# Caminho para o arquivo Excel
+FUEL_XLSX_FILE = os.path.join(os.path.dirname(__file__), "fuel_prices.xlsx")
 
 # Google API Key (Substitua pela sua chave válida)
-API_KEY = ""
+API_KEY = "AIzaSyBogaEWk_zBktHsax4yWagruLwibpgMNbM"
 
 # Google Geocoding API URL
 GEOCODE_API_URL = "https://maps.googleapis.com/maps/api/geocode/json"
 
-# Função para obter coordenadas a partir de um endereço
-def get_coordinates(address):
-    params = {
-        "address": address,
-        "key": API_KEY
-    }
-    response = requests.get(GEOCODE_API_URL, params=params)
-    
-    if response.status_code == 200:
-        data = response.json()
-        if data["status"] == "OK":
-            location = data["results"][0]["geometry"]["location"]
-            return float(location["lat"]), float(location["lng"])
-    
-    return None, None  # Retorna None se o endereço não for encontrado
+# Função para obter coordenadas a partir de um endereço com requisição assíncrona
+async def get_coordinates(address, session):
+    url = f"https://maps.googleapis.com/maps/api/geocode/json?address={address}&key={API_KEY}"
+    async with session.get(url) as response:
+        if response.status == 200:  # Alterado de status_code para status
+            data = await response.json()
+            results = data.get("results")
+            if results:
+                lat = results[0]["geometry"]["location"]["lat"]
+                lon = results[0]["geometry"]["location"]["lng"]
+                return lat, lon
+        return None, None
 
-# Google Directions API URL
-DIRECTIONS_API_URL = "https://maps.googleapis.com/maps/api/directions/json"
+# Função para atualizar o arquivo XLSX com as coordenadas
+async def update_xlsx_with_coordinates():
+    # Carregar o arquivo XLSX com pandas
+    df = pd.read_excel(FUEL_XLSX_FILE)
 
-@api_view(["POST"])
-def calculate_route(request):
-    data = request.data
-    start_location = data.get("start_location")
-    finish_location = data.get("finish_location")
-
-    if not start_location or not finish_location:
-        return JsonResponse({"error": "Both start_location and finish_location fields are required."}, status=400)
-
-    # Solicita dados da rota na Google Directions API
-    params = {
-        "origin": start_location,
-        "destination": finish_location,
-        "key": API_KEY
-    }
-    route_response = requests.get(DIRECTIONS_API_URL, params=params)
-
-    if route_response.status_code != 200:
-        return JsonResponse({"error": "Failed to retrieve route data."}, status=500)
-
-    route_data = route_response.json()
-
-    if route_data["status"] != "OK" or "routes" not in route_data:
-        return JsonResponse({"error": "Could not calculate the route."}, status=400)
-
-    total_distance_miles = sum(leg["distance"]["value"] for leg in route_data["routes"][0]["legs"]) / 1609  # Convert meters to miles
-
-    response_data = {
-        "route_map": f"https://www.google.com/maps/dir/{start_location}/{finish_location}",
-        "total_distance_miles": round(total_distance_miles, 2),
-    }
-
-    return JsonResponse(response_data)
-
-
-def update_csv_with_coordinates():
-    # Carregar o CSV com delimitador adequado e garantindo que as aspas sejam tratadas corretamente
-    df = pd.read_csv(FUEL_CSV_FILE, sep=",", quotechar='"', encoding='utf-8')  # Ajuste para vírgula e aspas
-
-    # Limpeza de possíveis espaços extras nos nomes das colunas
+    # Limpeza de possíveis espaços extras nos nomes das colunas e nos dados
     df.columns = df.columns.str.strip()
+    df['Address'] = df['Address'].str.strip()
+    df['City'] = df['City'].str.strip()
+    df['State'] = df['State'].str.strip()
+    df['Truckstop Name'] = df['Truckstop Name'].str.strip()
 
     # Adiciona as colunas de Latitude e Longitude, se não existirem
-    if 'Latitude' not in df.columns or 'Longitude' not in df.columns:
+    if 'Latitude' not in df.columns:
         df['Latitude'] = None
+    if 'Longitude' not in df.columns:
         df['Longitude'] = None
 
-    needs_update = False  # Flag para verificar se alguma atualização foi feita
+    needs_update = True  # Flag para verificar se alguma atualização foi feita
 
-    # Iterar sobre as linhas do DataFrame
-    for index, row in df.iterrows():
-        # Verifica se as colunas de endereço, cidade, estado e nome do truckstop têm dados
-        if pd.notna(row['Address']) and pd.notna(row['City']) and pd.notna(row['State']) and pd.notna(row['Truckstop Name']):
-            address = f"{row['Address']}, {row['City']}, {row['State']}"
+    # Preparar as tarefas assíncronas para obtenção das coordenadas
+    async with aiohttp.ClientSession() as session:
+        tasks = []
+        for index, row in df.iterrows():
+            # Verifica se as colunas de endereço, cidade, estado e nome do truckstop têm dados
+            if pd.notna(row['Address']) and pd.notna(row['City']) and pd.notna(row['State']) and pd.notna(row['Truckstop Name']):
+                address = f"{row['Address']}, {row['City']}, {row['State']}"
+                
+                # Verifica se a latitude e longitude estão ausentes ou vazias
+                if pd.isna(row['Latitude']) or pd.isna(row['Longitude']):
+                    tasks.append(update_coordinates(index, row, address, df, session))  # Adiciona a tarefa
 
-            # Verifica se a latitude e longitude estão ausentes ou vazias
-            if pd.isna(row['Latitude']) or pd.isna(row['Longitude']):
-                lat, lon = get_coordinates(address)
+        # Executa todas as tarefas assíncronas simultaneamente
+        await asyncio.gather(*tasks)
 
-                if lat and lon:
-                    df.at[index, 'Latitude'] = lat
-                    df.at[index, 'Longitude'] = lon
-                    needs_update = True
-                    print(f"Obtido lat/long para: {address} -> {lat}, {lon}")
-                else:
-                    print(f"Não foi possível obter lat/long para: {address}")
-
-                time.sleep(0.5)  # Pequeno delay para evitar limite de requisições da API
-        else:
-            print(f"Linha ignorada por dados incompletos: {row}")
-
-    # Se alguma atualização foi feita, salva de volta no CSV
+    # Se alguma atualização foi feita, salva de volta no arquivo XLSX
     if needs_update:
-        df.to_csv(FUEL_CSV_FILE, index=False, sep=",", encoding='utf-8')  # Salva com vírgula como delimitador
+        df.to_excel(FUEL_XLSX_FILE, index=False)
 
-# Executa a atualização do CSV
-update_csv_with_coordinates()
+# Função para atualizar coordenadas em uma linha específica
+async def update_coordinates(index, row, address, df, session):
+    lat, lon = await get_coordinates(address, session)
+    if lat and lon:
+        df.at[index, 'Latitude'] = lat
+        df.at[index, 'Longitude'] = lon
+        print(f"Obtido lat/long para: {address} -> {lat}, {lon}")
+    else:
+        print(f"Não foi possível obter lat/long para: {address}")
 
+# Executa a atualização do XLSX
+async def main():
+    await update_xlsx_with_coordinates()
+
+# Executa a função principal de maneira assíncrona
+asyncio.run(main())
 
 # This sets up the free map API configuration for route calculation
 MAPS_API_URL = "https://router.project-osrm.org/route/v1/driving"
@@ -120,7 +93,7 @@ MAPS_API_URL = "https://router.project-osrm.org/route/v1/driving"
 # This function loads the fuel stations' information from the CSV file
 def load_fuel_prices():
     fuel_stations = []
-    with open(FUEL_CSV_FILE, newline='', encoding='utf-8') as csvfile:
+    with open(FUEL_XLSX_FILE, newline='', encoding='utf-8') as csvfile:
         reader = csv.DictReader(csvfile)
         for row in reader:
             fuel_stations.append({
